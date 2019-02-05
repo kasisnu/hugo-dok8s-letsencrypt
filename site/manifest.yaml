@@ -1,0 +1,137 @@
+# Check out Part 1 - https://kasisnu.com/posts/running-hugo-the-hard-way/
+#
+# # Create a Service that redirects to our pods
+#
+# https://kubernetes.io/docs/concepts/services-networking/service/
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+  # This label has no special meaning. Only useful for debugging.
+    owner: kasisnu
+  name: web
+  # Consider using a namespace other than default.
+  namespace: default
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 1313
+  selector:
+    service: web
+  type: LoadBalancer
+---
+# Create an Ingress that redirects to our "web" Service
+#
+# https://kubernetes.github.io/ingress-nginx/how-it-works/
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: www
+  namespace: default
+  annotations:
+    # Use nginx ingress
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/add-base-url: "true"
+    # Setup http->https redirection
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # Talk to the cluster issuer we set up in Part 1 - 
+    certmanager.k8s.io/cluster-issuer: letsencrypt-prod
+    # Having a low TTL value makes debugging easier
+    # We can and probably should raise this to a higher value
+    external-dns.alpha.kubernetes.io/ttl: "60"
+spec:
+  tls:
+    # Be vocal about the (sub)domains we're interested in
+   - hosts:
+     - domain.tld      # example.com
+     - www.domain.tld  # www.example.com
+     # Where we store our certificates
+     secretName: domain-tls-certificate  # Once this Ingress is created, inspect the certifictate with "kubectl get certificates"
+  rules:
+  # Create routes that redirect to the "http" port on our "web" Service
+  - host: domain.tld
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: web
+          servicePort: http
+  - host: www.domain.tld
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: web
+          servicePort: http
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  labels:
+    owner: kasisnu
+    service: web
+  name: web
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: web
+  template:
+    metadata:
+      labels:
+        service: web
+      name: web
+    spec:
+      containers:
+      # This is a very ugly hack but the gist of it is
+      # that we serve content from the directory "/srv" from inside the container at "/"
+      # Check out https://github.com/kasisnu/fsserve
+      - image: kasisnu/fsserve:v1.1
+        # Make sure we're running the latest version of the container image if/after we terminate our pods
+        imagePullPolicy: Always
+        # Configure a very basic healthcheck
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /
+            port: 1313
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 3
+          timeoutSeconds: 1
+        name: fsserve
+        ports:
+        # Expose port 1313 where our web server is running
+        - containerPort: 1313
+          protocol: TCP
+        volumeMounts:
+        # We'll come back to this
+        - mountPath: /srv
+          name: storage-volume
+      initContainers:
+      # Our goal here is simple.
+      # Let's make our content available for the fsserve container to serve from "/srv"
+      # This can be modified. As long as we can make our static files available to fsserve,
+      # everything else in this manifest will not need to be modified
+      # ex, we can unpack a tarball here
+      - args:
+        - -a
+        - /var/www/
+        - /mnt/data
+        command:
+        - rsync
+        image: kasisnu/kasisnu.com:latest
+        imagePullPolicy: Always
+        name: storage
+        volumeMounts:
+        - mountPath: /mnt/data
+          name: storage-volume
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      volumes:
+      # Create a volume that our initContainer and our fsserve container can share
+      - emptyDir: {}
+        name: storage-volume
